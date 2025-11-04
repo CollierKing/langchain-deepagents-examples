@@ -188,31 +188,81 @@ class LoggingMiddleware(AgentMiddleware):
         print(f"{Fore.CYAN}{'─' * 40}{Style.RESET_ALL}\n")
 
 
-# MARK: - S3DataMiddleware
-class S3DataMiddleware(AgentMiddleware):
-    def __init__(self, bucket_name: str, run_name: str):
+# MARK: - Validation File Tracker Middleware
+class ValidationFileTrackerMiddleware(AgentMiddleware):
+    """Tracks when validation files are written to ensure every queried company gets a file."""
+    
+    def __init__(self):
         super().__init__()
-        from botocore.config import Config
+        print(f"{Back.CYAN}{Fore.WHITE} ValidationFileTrackerMiddleware initialized {Style.RESET_ALL}")
+    
+    def after_tool(self, state, runtime, tool_call, tool_result):
+        """Detect when validation files are written and mark company as complete."""
+        # Log ALL tool calls for debugging
+        tool_name = tool_call.get("name", "unknown")
+        logger.info(f"🔧 ValidationFileTracker: after_tool called for '{tool_name}'")
+        
+        if tool_name != "write_file":
+            return None
+        
+        # Check if this is a validation file
+        args = tool_call.get("args", {})
+        file_path = args.get("file_path", "")
+        
+        # Normalize path (remove leading slash if present)
+        normalized_path = file_path.lstrip("/")
+        
+        logger.info(f"🔧 write_file detected: path='{file_path}' normalized='{normalized_path}'")
+        
+        # Extract ticker from validation file path: validations/company_NVDA.json → NVDA
+        if normalized_path.startswith("validations/company_") and normalized_path.endswith(".json"):
+            ticker = normalized_path.replace("validations/company_", "").replace(".json", "")
+            
+            logger.info(f"🎯 Validation file detected for ticker: {ticker}")
+            
+            # Mark this company's validation file as written
+            from tools import _company_state
+            
+            logger.info(f"🔧 Before mark_file_written: last_queried={_company_state.last_queried_company}, current_index={_company_state.current_index}")
+            
+            _company_state.mark_file_written(ticker)
+            
+            logger.info(f"🔧 After mark_file_written: last_queried={_company_state.last_queried_company}, current_index={_company_state.current_index}")
+            logger.info(f"✓ Validation file written for {ticker}")
+            print(f"{Back.GREEN}{Fore.BLACK} ✓ Saved validations/company_{ticker}.json {Style.RESET_ALL}")
+        else:
+            logger.info(f"⚠️ write_file path doesn't match validation pattern: '{normalized_path}'")
+        
+        return None
 
-        # Read AWS credentials from environment (loaded via .env if present)
+
+# MARK: - S3 Backend for FilesystemMiddleware
+class S3Backend:
+    """Backend that stores files in S3, implementing BackendProtocol for FilesystemMiddleware."""
+    
+    def __init__(self, bucket_name: str, run_name: str):
+        from botocore.config import Config
+        from datetime import datetime as dt
+        
+        self.datetime = dt  # Store for later use
+        
+        # Read AWS credentials from environment
         aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
         aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
         aws_endpoint_url = os.getenv("AWS_ENDPOINT_URL")
         aws_session_token = os.getenv("AWS_SESSION_TOKEN")
-        aws_region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
 
-        # Create session first (match your working code exactly - no region in session)
+        # Create session
         session_kwargs = {}
         if aws_access_key_id and aws_secret_access_key:
             session_kwargs["aws_access_key_id"] = aws_access_key_id
             session_kwargs["aws_secret_access_key"] = aws_secret_access_key
         if aws_session_token:
             session_kwargs["aws_session_token"] = aws_session_token
-        # Note: Do NOT add region_name here for R2 compatibility
 
         s3_session = boto3.Session(**session_kwargs)
 
-        # Create client from session with endpoint and config
+        # Create S3 client
         client_kwargs = {}
         if aws_endpoint_url:
             client_kwargs["endpoint_url"] = aws_endpoint_url
@@ -220,54 +270,173 @@ class S3DataMiddleware(AgentMiddleware):
 
         self.s3_client = s3_session.client("s3", **client_kwargs)
         self.bucket = bucket_name
-        self.run_name = run_name
-        self.tools = [self._create_read_s3_tool(), self._create_write_s3_tool()]
-
-    # MARK: - Tool: Read from S3
-    def _create_read_s3_tool(self):
-        @tool
-        def read_from_s3(key: str) -> str:
-            """Read a file from S3.
-            For input data, use:
-              - transcripts/transcript.txt (text file)
-              - company_descriptions/companies.json (JSON file)
-              - press_releases/releases.json (JSON file)
-            For run outputs, use: <filename> (will be scoped to current run automatically)
-            """
-            # If key doesn't have a prefix, assume it's a run output
-            if "/" not in key:
-                full_key = f"deepagent_runs/{self.run_name}/{key}"
+        self.run_prefix = f"deepagent_runs/{run_name}"
+        
+        print(f"{Back.CYAN}{Fore.WHITE} S3Backend initialized (bucket={bucket_name}, prefix={self.run_prefix}) {Style.RESET_ALL}")
+    
+    def _get_s3_key(self, file_path: str) -> str:
+        """Convert virtual file path to S3 key."""
+        # Handle both absolute-style paths and relative paths
+        clean_path = file_path.lstrip('/')
+        
+        # If path starts with known input prefixes, use as-is
+        if clean_path.startswith(('transcripts/', 'company_descriptions/', 'press_releases/')):
+            return clean_path
+        
+        # Otherwise scope to run directory
+        return f"{self.run_prefix}/{clean_path}"
+    
+    def ls_info(self, path: str) -> list[dict]:
+        """List S3 objects in directory."""
+        try:
+            s3_key = self._get_s3_key(path)
+            if not s3_key.endswith('/'):
+                s3_key += '/'
+            
+            response = self.s3_client.list_objects_v2(
+                Bucket=self.bucket,
+                Prefix=s3_key,
+                Delimiter='/'
+            )
+            
+            results = []
+            
+            # Directories
+            for prefix in response.get('CommonPrefixes', []):
+                dir_path = '/' + prefix['Prefix'].removeprefix(self.run_prefix + '/').rstrip('/')
+                results.append({
+                    'path': dir_path + '/',
+                    'is_dir': True,
+                    'size': 0,
+                    'modified_at': self.datetime.now().isoformat()
+                })
+            
+            # Files
+            for obj in response.get('Contents', []):
+                file_path = '/' + obj['Key'].removeprefix(self.run_prefix + '/')
+                # Skip the directory itself
+                if file_path.rstrip('/') == path.rstrip('/'):
+                    continue
+                results.append({
+                    'path': file_path,
+                    'is_dir': False,
+                    'size': obj['Size'],
+                    'modified_at': obj['LastModified'].isoformat()
+                })
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error listing S3 path {path}: {e}")
+            return []
+    
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> str:
+        """Read file from S3 with line numbers."""
+        try:
+            s3_key = self._get_s3_key(file_path)
+            response = self.s3_client.get_object(Bucket=self.bucket, Key=s3_key)
+            content = response['Body'].read().decode('utf-8')
+            
+            lines = content.splitlines()
+            
+            # Apply offset and limit
+            selected_lines = lines[offset:offset + limit] if limit else lines[offset:]
+            
+            # Format with line numbers (1-indexed)
+            formatted_lines = [
+                f"{i + offset + 1:6d}|{line}"
+                for i, line in enumerate(selected_lines)
+            ]
+            
+            return '\n'.join(formatted_lines) if formatted_lines else 'File is empty.'
+        except Exception as e:
+            return f"Error reading file: {str(e)}"
+    
+    def grep_raw(self, pattern: str, path: str | None = None, glob: str | None = None) -> list[dict] | str:
+        """Search S3 files for pattern (simplified - downloads and searches)."""
+        # For simplicity, just return error - grep in S3 is complex
+        return "grep not supported for S3 backend (files are remote)"
+    
+    def glob_info(self, pattern: str, path: str = "/") -> list[dict]:
+        """Glob match S3 objects."""
+        import fnmatch
+        
+        try:
+            # List all objects under path
+            s3_key = self._get_s3_key(path)
+            response = self.s3_client.list_objects_v2(
+                Bucket=self.bucket,
+                Prefix=s3_key
+            )
+            
+            results = []
+            for obj in response.get('Contents', []):
+                file_path = '/' + obj['Key'].removeprefix(self.run_prefix + '/')
+                
+                # Match against pattern
+                if fnmatch.fnmatch(file_path, pattern) or fnmatch.fnmatch(file_path.lstrip('/'), pattern):
+                    results.append({
+                        'path': file_path,
+                        'is_dir': False,
+                        'size': obj['Size'],
+                        'modified_at': obj['LastModified'].isoformat()
+                    })
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error globbing S3 pattern {pattern}: {e}")
+            return []
+    
+    def write(self, file_path: str, content: str):
+        """Write file to S3."""
+        from deepagents.backends.protocol import WriteResult
+        
+        try:
+            s3_key = self._get_s3_key(file_path)
+            self.s3_client.put_object(
+                Bucket=self.bucket,
+                Key=s3_key,
+                Body=content.encode('utf-8')
+            )
+            
+            logger.info(f"Wrote {s3_key} to S3")
+            return WriteResult(path=file_path, files_update=None)  # None = external storage
+        except Exception as e:
+            error_msg = f"Error writing to S3: {str(e)}"
+            logger.error(error_msg)
+            return WriteResult(error=error_msg)
+    
+    def edit(self, file_path: str, old_string: str, new_string: str, replace_all: bool = False):
+        """Edit file in S3 (read, modify, write back)."""
+        from deepagents.backends.protocol import EditResult
+        
+        try:
+            # Read current content
+            s3_key = self._get_s3_key(file_path)
+            response = self.s3_client.get_object(Bucket=self.bucket, Key=s3_key)
+            content = response['Body'].read().decode('utf-8')
+            
+            # Perform replacement
+            if replace_all:
+                new_content = content.replace(old_string, new_string)
+                occurrences = content.count(old_string)
             else:
-                full_key = key
-
-            try:
-                response = self.s3_client.get_object(Bucket=self.bucket, Key=full_key)
-                return response["Body"].read().decode("utf-8")
-            except Exception as e:
-                return f"Error reading {full_key} from S3: {str(e)}"
-
-        return read_from_s3
-
-    # MARK: - Tool: Write to S3
-    def _create_write_s3_tool(self):
-        @tool
-        def write_to_s3(key: str, content: str) -> str:
-            """Write content to S3 in the current run directory.
-            All files are automatically scoped to deepagent_runs/<run_name>/
-
-            Examples:
-              - 'result.json' -> 'deepagent_runs/run_name/result.json'
-              - 'company_matches/batch_0.json' -> 'deepagent_runs/run_name/company_matches/batch_0.json'
-            """
-            # Always scope to run directory
-            full_key = f"deepagent_runs/{self.run_name}/{key}"
-
-            try:
-                self.s3_client.put_object(
-                    Bucket=self.bucket, Key=full_key, Body=content.encode("utf-8")
-                )
-                return f"Successfully wrote {full_key} to S3"
-            except Exception as e:
-                return f"Error writing {full_key} to S3: {str(e)}"
-
-        return write_to_s3
+                # Replace first occurrence only
+                new_content = content.replace(old_string, new_string, 1)
+                occurrences = 1 if old_string in content else 0
+            
+            if occurrences == 0:
+                return EditResult(error=f"String not found in {file_path}")
+            
+            # Write back
+            self.s3_client.put_object(
+                Bucket=self.bucket,
+                Key=s3_key,
+                Body=new_content.encode('utf-8')
+            )
+            
+            logger.info(f"Edited {s3_key} in S3 ({occurrences} occurrences)")
+            return EditResult(path=file_path, files_update=None, occurrences=occurrences)
+        except Exception as e:
+            error_msg = f"Error editing file in S3: {str(e)}"
+            logger.error(error_msg)
+            return EditResult(error=error_msg)

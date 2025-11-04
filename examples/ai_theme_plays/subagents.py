@@ -11,37 +11,63 @@ from config import (
     CONTEXT_WINDOW_TOTAL,
     MAX_OUTPUT_TOKENS,
 )
-from middleware import LoggingMiddleware, S3DataMiddleware, ContentTruncationMiddleware
-from tools import get_companies_from_postgres, get_press_releases_from_mongodb
+from middleware import (
+    LoggingMiddleware,
+    ContentTruncationMiddleware,
+    S3Backend,
+    ValidationFileTrackerMiddleware,
+)
+from deepagents.middleware.filesystem import FilesystemMiddleware
+from tools import (
+    get_companies_from_postgres,
+    consolidate_batch_files,
+    get_press_releases_from_mongodb,
+    get_company_tickers_from_matched_file,
+    consolidate_validation_files,
+    merge_and_rank_companies,
+)
 from models import ThemesOutput, CompanyMatchesOutput, ValidationOutput, FinalOutput
 import json
 
 # MARK: - Configuration
 model = MODEL
-s3_middleware = S3DataMiddleware(bucket_name=S3_BUCKET_NAME, run_name=RUN_NAME)
-content_truncation = ContentTruncationMiddleware(
-    max_tokens=CONTEXT_WINDOW_TOTAL - MAX_OUTPUT_TOKENS - 5_000
-)
 
-# Extract S3 tools from middleware
-read_from_s3 = s3_middleware.tools[0]
-write_to_s3 = s3_middleware.tools[1]
+
+# Factory functions to create fresh middleware instances for each subagent
+def create_s3_filesystem():
+    """Create new S3 filesystem middleware instance"""
+    s3_backend_factory = lambda rt: S3Backend(
+        bucket_name=S3_BUCKET_NAME, run_name=RUN_NAME
+    )
+    return FilesystemMiddleware(backend=s3_backend_factory)
+
+
+def create_content_truncation():
+    """Create new content truncation middleware instance"""
+    return ContentTruncationMiddleware(
+        max_tokens=CONTEXT_WINDOW_TOTAL - MAX_OUTPUT_TOKENS - 5_000
+    )
+
 
 # MARK: - Subagent 1: Transcript Analyzer
 analyzer_system_prompt = f"""You are an expert at analyzing transcripts.  
   
-1. Use read_from_s3 to read '{TRANSCRIPT_S3_KEY}'
+1. Use read_file to read '{TRANSCRIPT_S3_KEY}'
 2. Analyze it to identify key themes, trends, and focus areas  
-3. Write your analysis to 'themes_analysis.json' using write_to_s3
+3. Write your analysis to 'themes_analysis.json' using write_file
 
 OUTPUT SCHEMA (ThemesOutput from models.py):
 {json.dumps(ThemesOutput.model_json_schema(), indent=2)}"""
 
 analyzer_graph = create_agent(
     model=model,
-    tools=[read_from_s3, write_to_s3],
+    tools=[],
     system_prompt=analyzer_system_prompt,
-    middleware=[content_truncation, s3_middleware, LoggingMiddleware()],
+    middleware=[
+        create_s3_filesystem(),
+        create_content_truncation(),
+        LoggingMiddleware(),
+    ],
 )
 
 # MARK: - Subagent 2: Company Matcher
@@ -62,7 +88,7 @@ DO NOT rationalize skipping batches because:
 
 WORKFLOW:
 
-1. Read themes: read_from_s3('themes_analysis.json')
+1. Read themes: read_file('themes_analysis.json')
 
 2. Initialize tracking:
    - current_offset = 0
@@ -76,7 +102,7 @@ WORKFLOW:
    
    b) Evaluate each company in results against themes
    
-   c) Write results: write_to_s3('company_matches/batch_{{current_offset:04d}}.json', <matches_json>)
+   c) Write results: write_file('company_matches/batch_{{current_offset:04d}}.json', <matches_json>)
       ↳ Use 4-digit zero-padded offset (e.g., batch_0000.json, batch_0050.json)
       ↳ Write this file even if matches list is empty []
    
@@ -99,21 +125,21 @@ WORKFLOW:
    - Deciding to "sample" instead of processing all companies
 
 4. Consolidation (only after ALL batches complete):
-   - Review all batch_*.json files (batch_0000.json, batch_0050.json, etc.)
-   - Select top {TOP_COMPANY_MATCHES} matches
-   - Write to 'matched_companies.json'
+   - Call consolidate_batch_files() tool
+   - This automatically reads all company_matches/batch_*.json files, ranks all matches, and writes matched_companies.json
+   - Returns confirmation with total match count
 
 OUTPUT SCHEMA (CompanyMatchesOutput from models.py):
 {json.dumps(CompanyMatchesOutput.model_json_schema(), indent=2)}"""
 
 matcher_graph = create_agent(
     model=model,
-    tools=[read_from_s3, write_to_s3, get_companies_from_postgres],
+    tools=[get_companies_from_postgres, consolidate_batch_files],
     system_prompt=matcher_system_prompt,
     middleware=[
         # Sequential enforcement is built into get_companies_from_postgres tool itself
-        content_truncation,
-        s3_middleware,
+        create_s3_filesystem(),
+        create_content_truncation(),
         LoggingMiddleware(),
     ],
 )
@@ -140,7 +166,11 @@ DO NOT rationalize skipping companies because:
 
 WORKFLOW:
 
-1. Read companies: read_from_s3('matched_companies.json')
+1. Initialize validation queue:
+   - Call get_company_tickers_from_matched_file()
+   - This extracts ALL ticker symbols from matched_companies.json
+   - Returns the ordered list of companies you MUST validate sequentially
+   - DO NOT call read_file('matched_companies.json') - use this tool instead
 
 2. SEQUENTIAL COMPANY PROCESSING (Process ALL companies):
    
@@ -148,23 +178,28 @@ WORKFLOW:
    
    For EACH and EVERY company in the matched_companies list (loop through entire list):
    
-   a) Extract: ticker and matched_themes for this company
+   a) Get next ticker from the company list returned by get_company_tickers_from_matched_file
    
-   b) Query: get_press_releases_from_mongodb(symbols="TICKER", skip=0, limit={PRESS_RELEASE_BATCH_SIZE})
-      ↳ Use ONLY one ticker at a time
-      ↳ Always use skip=0
+   b) Query press releases: get_press_releases_from_mongodb(symbols="TICKER", skip=0, limit={PRESS_RELEASE_BATCH_SIZE})
+      ↳ Use ONLY one ticker at a time, skip=0
    
-   c) Evaluate: Review each press release for theme support:
-      - Does pr_title or content relate to the identified themes?
-      - Does it show company activity in this theme area?
-      - Is it a positive indicator of alignment?
-      - For supporting evidence, capture: evidence text, pr_title, pr_link
+   c) Analyze the press release results:
+      - Review pr_title and content for theme alignment
+      - Determine: supports_themes (true/false)
+      - Calculate: confidence_adjustment (-1.0 to +1.0)
+      - Calculate: adjusted_score = original_score + confidence_adjustment
+      - Extract: key evidence with pr_title and pr_link
    
-   d) Write: write_to_s3('validations/company_{{TICKER}}.json', <validation_list_json>)
-      ↳ key_evidence should be array of objects: [{{"evidence": "...", "pr_title": "...", "pr_link": "..."}}]
-      ↳ Use exact ticker symbol (e.g., company_NVDA.json, company_MSFT.json)
-      ↳ Write this file even if validation list is empty []
-      ↳ Must write BEFORE processing next company
+   d) IMMEDIATELY write validation: write_file('validations/company_{{TICKER}}.json', <validation_json>)
+      ↳ DO NOT SKIP THIS STEP - you cannot query next company without writing this file first
+      ↳ REQUIRED fields: ticker, company_name, original_themes, original_score, 
+                         press_release_validation, supports_themes, evidence_summary,
+                         validation_status, confidence_adjustment, notes
+      ↳ OPTIONAL fields: adjusted_score, key_evidence, relevance_score
+      ↳ key_evidence format: [{{"evidence": "...", "pr_title": "...", "pr_link": "..."}}]
+      ↳ Use exact ticker (e.g., company_NVDA.json, company_MSFT.json)
+      ↳ Write this file IMMEDIATELY after analyzing PRs
+      ↳ Even if no evidence found, still write with supports_themes=false
    
    e) Move to next company in list
    
@@ -177,22 +212,26 @@ WORKFLOW:
    - Deciding to validate only a "sample" of companies
 
 3. Consolidation (only after ALL companies complete):
-   - Review all validations/company_*.json files (company_NVDA.json, company_MSFT.json, etc.)
-   - Combine all validations
-   - Write to 'validated_results.json'
-   - ONLY include press releases where supports_theme=true
+   - Call consolidate_validation_files() tool
+   - This automatically reads all validations/company_*.json files, combines them, and writes validated_results.json
+   - Returns confirmation with total validation count
 
 OUTPUT SCHEMA (ValidationOutput from models.py):
 {json.dumps(ValidationOutput.model_json_schema(), indent=2)}"""
 
 validator_graph = create_agent(
     model=model,
-    tools=[read_from_s3, write_to_s3, get_press_releases_from_mongodb],
+    tools=[
+        get_company_tickers_from_matched_file,
+        get_press_releases_from_mongodb,
+        consolidate_validation_files,
+    ],
     system_prompt=validator_system_prompt,
     middleware=[
         # Sequential enforcement is built into get_press_releases_from_mongodb tool itself
-        content_truncation,
-        s3_middleware,
+        create_s3_filesystem(),
+        ValidationFileTrackerMiddleware(),  # Tracks when validation files are written
+        create_content_truncation(),  # Safe now - ticker extraction happens in tool
         LoggingMiddleware(),
     ],
 )
@@ -200,49 +239,35 @@ validator_graph = create_agent(
 # MARK: - Subagent 4: Final Ranker
 ranker_system_prompt = f"""You are an expert at consolidating and ranking analysis results.
 
-YOUR GOAL: Merge company matches with their validation results and create final rankings.
+YOUR GOAL: Create final company rankings by merging match and validation data.
 
 WORKFLOW:
 
-1. Read both files from S3:
-   - matched_companies.json (contains matches with original scores)
-   - validated_results.json (contains validations with adjusted scores)
+1. Call merge_and_rank_companies() tool
+   - This automatically:
+     * Reads matched_companies.json and validated_results.json from S3
+     * Merges data for each company (uses adjusted_score if available)
+     * Re-ranks all companies by final_score
+     * Takes top {TOP_COMPANY_MATCHES}
+     * Writes final_rankings.json
 
-2. Merge the data:
-   a) Start with all companies from matched_companies.json
-   b) For EACH company, look up its validation in validated_results.json (if exists)
-   c) Create merged record:
-      - If validation exists AND has adjusted_score: use adjusted_score as final_score
-      - If validation exists but NO adjusted_score: use original_score
-      - If no validation exists: use original_score
-      - Combine: matched_themes, alignment_factors from match
-      - Add (if available): validation_status, press_release_validation, evidence_summary, key_evidence, confidence_adjustment, notes from validation
+2. After merge completes:
+   - Read final_rankings.json to see the results
+   - Create a brief summary highlighting top companies and key findings
+   - Write summary to 'ranking_summary.txt' using write_file
 
-3. Re-rank companies:
-   - Sort ALL companies by final_score (descending)
-   - Take top {TOP_COMPANY_MATCHES} companies
-   - Assign rank: 1 to {TOP_COMPANY_MATCHES}
-
-4. Create summary statistics:
-   - Calculate theme_distribution (count of companies per theme)
-   - Calculate average_score across top {TOP_COMPANY_MATCHES}
-   - Calculate score_ranges distribution
-   - Calculate industry_representation (if industry data available)
-
-5. Write final output:
-   - Write to 'final_rankings.json' using write_to_s3
-   - Include metadata, top_100_companies, and summary_statistics
+That's it! The merge_and_rank_companies tool does the heavy lifting automatically.
 
 OUTPUT SCHEMA (FinalOutput from models.py):
-{{json.dumps(FinalOutput.model_json_schema(), indent=2)}}"""
+{json.dumps(FinalOutput.model_json_schema(), indent=2)}"""
 
 ranker_graph = create_agent(
     model=model,
-    tools=[read_from_s3, write_to_s3],
+    tools=[merge_and_rank_companies],
     system_prompt=ranker_system_prompt,
     middleware=[
-        content_truncation,
-        s3_middleware,
+        create_s3_filesystem(),
+        create_content_truncation(),
         LoggingMiddleware(),
     ],
 )

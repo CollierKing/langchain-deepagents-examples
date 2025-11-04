@@ -153,19 +153,15 @@ class CompanyValidation(BaseCompanyInfo):
     relevance_score: Optional[float] = Field(None, description="How relevant the press releases are to the themes (0.0 to 1.0)")
 
 
-class BatchSummary(BaseModel):
-    validated: int = Field(..., description="Number of companies successfully validated")
-    unvalidated_missing_data: int = Field(..., description="Number of companies lacking sufficient press release data")
-    contradicted: int = Field(..., description="Number of companies where evidence contradicted the match")
-    strongest_validation: str = Field(..., description="Description of the strongest validation finding")
-    concerns: str = Field(..., description="Notable concerns or limitations found during validation")
+class ValidationMetadata(BaseModel):
+    consolidation_date: str = Field(..., description="Date validations were consolidated")
+    files_processed: int = Field(..., description="Number of individual validation files processed")
 
 
 class ValidationOutput(BaseModel):
-    batch: int = Field(..., description="Batch number being validated")
-    companies: List[str] = Field(..., description="List of company tickers being validated in this batch")
+    total_validations: int = Field(..., description="Total number of companies validated")
     validations: List[CompanyValidation] = Field(..., description="Detailed validation results for each company")
-    batch_summary: BatchSummary = Field(..., description="Summary statistics and highlights for this batch")
+    metadata: ValidationMetadata = Field(..., description="Consolidation metadata")
 
 
 # MARK: Final Combined Output

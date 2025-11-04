@@ -14,7 +14,7 @@ When a market leader telegraphs a major shift (AI infrastructure, quantum comput
 3. **Validate with evidence** - Can we prove they're actually doing it?
 4. **Rank by strength** - Who's leading vs. following?
 
-Manual analysis would take weeks. This agent does it in hours, processing 2000+ companies against multiple themes.
+Manual analysis would take weeks. This agent does it in minutes, processing hundreds of companies against multiple themes.
 
 ## The Pipeline
 
@@ -32,7 +32,7 @@ graph TB
     style E fill:#ffe1e1
     
     subgraph "PostgreSQL"
-    F[(2400+ Companies)]
+    F[(~400 'Tech' Companies)]
     end
     
     subgraph "MongoDB"
